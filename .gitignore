@@ -1,0 +1,19 @@
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.vscode/
+.env
+*.log
+
+# Generated datasets and experiment outputs
+data/processed/
+results/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt

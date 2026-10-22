@@ -1,0 +1,13 @@
+
+{
+  "project_name": "ExplainOpt-X",
+  "project_version": "0.1.0",
+  "source_directory": "samples/source",
+  "ir_directory": "samples/ir",
+  "raw_data_directory": "data/raw",
+  "processed_data_directory": "data/processed",
+  "results_directory": "results",
+  "default_optimization_levels": ["O0", "O2"],
+  "llvm_tools_directory": "C:/Program Files/LLVM/bin",
+  "target_triple": "x86_64-pc-windows-msvc"
+}
