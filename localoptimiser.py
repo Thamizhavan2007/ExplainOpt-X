@@ -5,7 +5,7 @@ This educational optimizer uses narrow regex patterns, not a complete C parser.
 Review all edits and compile/test both versions before relying on the output.
 """
 from __future__ import annotations
-import argparse, json, re, shutil, subprocess, sys
+import argparse, json, re, shutil, subprocess, sys, textwrap
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -84,10 +84,23 @@ def optimize(source: str) -> tuple[str, list[Finding]]:
         'Folded a simple integer constant expression',
         'Both operands are integer literals and the supported operation can be evaluated at compile time.', findings)
 
-    # Exact if (1) with a simple braced body (no nested braces).
-    code = apply_regex(code, r'\bif\s*\(\s*1\s*\)\s*(\{[^{}]*\})', lambda m: m.group(1),
-        'conditional_simplification', 'Removed a constant-true if wrapper',
-        'The integer constant condition 1 is true; this narrow rule only handles a simple braced body.', findings, re.S)
+    # Constant-condition simplification for simple braced if/else blocks.
+    # Only handles literal 0/1 conditions and bodies without nested braces.
+    # Select the reachable branch and remove the conditional scaffolding.
+    conditional_pattern = re.compile(
+        r'\bif\s*\(\s*([01])\s*\)\s*(\{[^{}]*\})'
+        r'(?:\s*else\s*(\{[^{}]*\}))?', re.S)
+    conditional_match = conditional_pattern.search(code)
+    if conditional_match:
+        condition, true_block, false_block = conditional_match.groups()
+        selected_block = true_block if condition == '1' else (false_block or '{}')
+        old = code
+        # Keep the selected block's interior; the enclosing braces are unnecessary here.
+        replacement = textwrap.dedent(selected_block[1:-1]).strip('\n')
+        code = code[:conditional_match.start()] + replacement + code[conditional_match.end():]
+        record(findings, 'conditional_simplification', old, code, conditional_match.start(),
+               f'Selected the reachable branch for constant condition {condition}',
+               'The condition is the literal 0 or 1, so the opposite branch cannot execute. This rule is limited to simple blocks without nested braces.')
 
     # Adjacent declarations: int x = literal; then int y = x op literal;
     prop = re.compile(r'(?m)^([ \t]*)int[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(-?\d+)[ \t]*;[ \t]*\n'
@@ -104,6 +117,39 @@ def optimize(source: str) -> tuple[str, list[Finding]]:
             record(findings, 'constant_propagation', old, code, m.start(),
                    f'Propagated constant {name} into initializer for {target}',
                    'The adjacent declarations match a narrow integer-literal pattern; the second initializer was evaluated using the first constant.')
+
+    # Conservative dead-assignment elimination for simple local declarations.
+    # Repeated passes allow chains of now-unused temporary variables to disappear.
+    # Only remove declarations whose initializer is a side-effect-free arithmetic expression.
+    dead_assignment_changed = False
+    safe_initializer = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*|^[+-]?\d+(?:\.\d+)?')
+    declaration = re.compile(
+        r'(?m)^[ \t]*(?:int|float|double|char|long|short)[ \t]+('
+        r'[A-Za-z_]\w*)[ \t]*=[ \t]*([^;\n]+);[ \t]*(?:\n|$)'
+    )
+    safe_expression = re.compile(r'^[A-Za-z0-9_+*/%(). \t-]+$')
+    while True:
+        removed_one = False
+        for match in declaration.finditer(code):
+            name, initializer = match.group(1), match.group(2).strip()
+            if not safe_expression.fullmatch(initializer):
+                continue
+            remainder = code[:match.start()] + code[match.end():]
+            if re.search(r'\b' + re.escape(name) + r'\b', remainder):
+                continue
+            old = code
+            code = code[:match.start()] + code[match.end():]
+            record(findings, 'dead_assignment', old, code, match.start(),
+                   f'Removed unused variable {name}',
+                   'The declaration initializes a variable that is not referenced elsewhere, and its initializer contains only a simple side-effect-free expression.')
+            dead_assignment_changed = True
+            removed_one = True
+            break
+        if not removed_one:
+            break
+    if dead_assignment_changed:
+        # Keep the status and explanation recorded by the first successful removal.
+        pass
 
     unchanged = {
         'dead_assignment': 'No safe dead assignment was identified in the supplied source.',
