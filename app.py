@@ -19,6 +19,7 @@ import sys
 import tempfile
 
 import traceback
+import time
 
 from datetime import datetime
 
@@ -3224,7 +3225,9 @@ if current_run is not None:
                 local_spec.loader.exec_module(local_module)
 
                 with st.spinner("Applying local C optimization rules..."):
+                    optimization_start = time.perf_counter()
                     optimizer_result = local_module.optimize_c_code(c_source)
+                    optimization_latency_seconds = time.perf_counter() - optimization_start
                     dashboard_data = local_module.build_dashboard_data(
                         c_source, optimizer_result
                     )
@@ -3232,6 +3235,7 @@ if current_run is not None:
                 st.session_state["explainopt_local_result"] = {
                     "result": optimizer_result,
                     "dashboard": dashboard_data,
+                    "optimization_latency_seconds": optimization_latency_seconds,
                 }
                 st.session_state["explainopt_local_source"] = c_source
 
@@ -3347,10 +3351,99 @@ if current_run is not None:
                 hide_index=True,
             )
 
+            st.divider()
+            st.header("Performance Metrics")
             st.caption(
-                "The optimizer uses predefined source-pattern rules. Review the output, "
-                "then compile and test it before relying on the changes. Runtime performance "
-                "is not measured by this statistics view."
+                "Benchmarks the current source and optimized output locally. Install GCC or Clang "
+                "and make it available on PATH for compilation and runtime measurements. "
+                "Results apply only to the test input and environment used here."
+            )
+
+            source_lines = len(c_source.splitlines())
+            optimized_lines = len(dashboard["optimized_code"].splitlines())
+            line_reduction = ((source_lines - optimized_lines) / source_lines * 100) if source_lines else 0.0
+            latency_ms = local_result.get("optimization_latency_seconds")
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Optimization latency", f"{latency_ms * 1000:.3f} ms" if latency_ms is not None else "N/A")
+            metric_cols[1].metric("Source-line reduction", f"{line_reduction:.2f}%")
+            metric_cols[2].metric("Source lines removed", max(0, source_lines - optimized_lines))
+            metric_cols[3].metric("Applied techniques", summary["successfully_applied"])
+
+            st.markdown("**Benchmark settings**")
+            compiler_choice = st.selectbox(
+                "C compiler", ["Auto", "GCC", "Clang"], index=0,
+                help="Auto selects GCC first, then Clang. LLVM opt.exe is not required for these benchmarks.",
+                key="explainopt_benchmark_compiler",
+            )
+            benchmark_stdin = st.text_area(
+                "Standard input for both programs (leave blank if not required)",
+                value="", key="explainopt_benchmark_stdin", height=90,
+            )
+            benchmark_repeats = st.selectbox(
+                "Runtime repetitions", [3, 5, 10], index=1,
+                key="explainopt_benchmark_repeats",
+                help="Each execution is limited to 5 seconds. Very short programs may have noisy timings.",
+            )
+            if st.button("Calculate performance metrics", key="calculate_explainopt_performance", type="primary"):
+                try:
+                    from performance_metrics import run_performance_benchmarks
+                    with st.spinner("Compiling and benchmarking the original and optimized C programs..."):
+                        performance = run_performance_benchmarks(
+                            c_source, dashboard["optimized_code"], benchmark_stdin,
+                            compiler_choice, int(benchmark_repeats),
+                        )
+                    st.session_state["explainopt_performance"] = {
+                        "source": c_source,
+                        "optimized_source": dashboard["optimized_code"],
+                        "result": performance,
+                    }
+                except Exception as exc:
+                    st.error(f"Performance measurement failed: {type(exc).__name__}: {exc}")
+                    with st.expander("Technical details"):
+                        st.code(traceback.format_exc(), language="text")
+
+            saved_performance = st.session_state.get("explainopt_performance")
+            if saved_performance and saved_performance.get("source") == c_source and saved_performance.get("optimized_source") == dashboard["optimized_code"]:
+                performance = saved_performance["result"]
+                if not performance.get("available"):
+                    st.warning(performance.get("message", "Performance measurements are unavailable."))
+                else:
+                    st.caption(f"Compiler used: {performance['compiler']} · Measurements are local to this machine.")
+                    runtime = performance.get("runtime_comparison")
+                    if runtime:
+                        perf_cols = st.columns(3)
+                        improvement = runtime.get("execution_time_improvement_percent")
+                        perf_cols[0].metric("Execution-time improvement", f"{improvement:.2f}%" if improvement is not None else "N/A", help="Positive means faster; negative means slower. Based on median of repeated -O0 runs.")
+                        correctness = performance.get("correctness")
+                        perf_cols[1].metric("Single-input correctness", f"{correctness['rate_percent']:.0f}%" if correctness else "N/A", help="Compares stdout, stderr, and exit status for one stdin scenario only.")
+                        robustness = performance.get("robustness", {})
+                        perf_cols[2].metric("Compile success rate", f"{robustness.get('configuration_compile_success_rate_percent', 0):.0f}%")
+                        st.caption(f"Original median runtime: {runtime['original_median_seconds'] * 1000:.3f} ms · Optimized median runtime: {runtime['optimized_median_seconds'] * 1000:.3f} ms · Repeated-run timing variation: original {runtime['original_runtime_variation_percent']:.2f}%, optimized {runtime['optimized_runtime_variation_percent']:.2f}%.")
+                        st.info(correctness["note"] if correctness else "Correctness could not be evaluated for this input.")
+                    elif performance.get("runtime_error"):
+                        st.warning(f"Runtime and correctness metrics unavailable: {performance['runtime_error']}")
+
+                    st.subheader("Compiler comparison")
+                    st.dataframe(pd.DataFrame(performance["configurations"]), use_container_width=True, hide_index=True)
+                    st.caption("Configurations: original -O0, ExplainOpt-X output -O0, original -O2, original -O3, and ExplainOpt-X output -O2. Compilation times are reported only when compilation succeeds.")
+
+                    st.subheader("Six-metric evaluation status")
+                    correctness = performance.get("correctness")
+                    robustness = performance.get("robustness", {})
+                    metric_rows = [
+                        {"Metric": "1. Execution-time improvement", "Result": (f"{runtime['execution_time_improvement_percent']:.2f}%" if runtime and runtime.get("execution_time_improvement_percent") is not None else "Not measured"), "Interpretation": "Median runtime comparison at -O0; can be noisy for short programs."},
+                        {"Metric": "2. Optimization latency", "Result": f"{latency_ms * 1000:.3f} ms" if latency_ms is not None else "Not measured", "Interpretation": "Time spent in the local source optimizer only; excludes UI and benchmark compilation."},
+                        {"Metric": "3. Code correctness rate", "Result": (f"{correctness['rate_percent']:.0f}% (1 test scenario)" if correctness else "Not measured"), "Interpretation": "One configured stdin scenario, output, stderr and exit status; not a formal equivalence proof."},
+                        {"Metric": "4. Source code size change", "Result": f"{line_reduction:.2f}% reduction", "Interpretation": f"{source_lines} original physical lines versus {optimized_lines} optimized physical lines; line reduction does not prove speedup."},
+                        {"Metric": "5. LLVM/compiler comparison", "Result": f"{sum(1 for row in performance['configurations'] if row['Compile success'] == 'Yes')}/5 configurations compiled", "Interpretation": "Comparison table above reports compile time and runtime for available configurations."},
+                        {"Metric": "6. Optimization robustness", "Result": f"{robustness.get('configuration_compile_success_rate_percent', 0):.0f}% configuration compile success; {performance.get('repeats', 0)} repeats", "Interpretation": robustness.get("scope_note", "A multi-program benchmark suite is needed to assess robustness across categories.")},
+                    ]
+                    st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("Run **Calculate performance metrics** to compile both versions and measure runtime, correctness for the supplied input, and compiler comparison configurations.")
+
+            st.caption(
+                "These measurements are experimental and specific to the current source, test input, compiler, and machine. Compile and test the output before relying on it; a single passing input does not prove correctness for all inputs."
             )
         elif local_result and local_source != c_source:
             st.info(
